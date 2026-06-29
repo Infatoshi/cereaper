@@ -63,14 +63,16 @@ final class Agent {
         return r
     }
 
-    func run(task: String, onEvent: @escaping (TranscriptEvent) -> Void) async -> RunRecord {
+    func run(task: String, onEvent: @escaping (RunEvent) -> Void) async -> RunRecord {
         var record = RunRecord()
         guard client.isConfigured else {
-            onEvent(.init(text: "✗ CEREBRAS_API_KEY not set. Export it and relaunch."))
+            onEvent(.status("✗ CEREBRAS_API_KEY not set. Export it and relaunch."))
             record.stoppedReason = "no-api-key"
+            onEvent(.stopped(record.stoppedReason))
             return record
         }
 
+        onEvent(.task(task))
         var messages: [Message] = [
             .system(Self.systemPrompt(tools: registry.specs.map { $0.function.name })),
             .userText(task),
@@ -97,15 +99,20 @@ final class Agent {
                     toolCalls: result.toolCalls.map { $0.name }
                 )
                 record.steps.append(rec)
+                onEvent(.timing(step: step,
+                                ttftSeconds: ttft,
+                                tokensPerSecond: tps,
+                                toolCalls: result.toolCalls.map { $0.name }))
 
-                let tpsStr = tps.map { String(format: "%.0f", $0) } ?? "n/a"
                 if !result.text.isEmpty {
-                    onEvent(.init(text: "  [\(tpsStr) tok/s] \(result.text)"))
+                    let tpsStr = tps.map { String(format: "%.0f", $0) } ?? "n/a"
+                    onEvent(.text("  [\(tpsStr) tok/s] \(result.text)"))
                 }
                 if result.toolCalls.isEmpty {
                     record.finalAnswer = result.text
                     record.stoppedReason = "model-done"
-                    onEvent(.init(text: "▸ final: \(result.text)"))
+                    onEvent(.finalAnswer(result.text))
+                    onEvent(.stopped(record.stoppedReason))
                     return record
                 }
 
@@ -116,25 +123,32 @@ final class Agent {
                 if let fa = result.toolCalls.first(where: { $0.name == "final_answer" }) {
                     record.finalAnswer = fa.argumentsJSON
                     record.stoppedReason = "final_answer"
-                    onEvent(.init(text: "▸ final_answer: \(fa.argumentsJSON)"))
+                    onEvent(.finalAnswer(fa.argumentsJSON))
+                    onEvent(.stopped(record.stoppedReason))
                     return record
                 }
 
                 for call in result.toolCalls {
-                    onEvent(.init(text: "  → \(call.name)(\(call.argumentsJSON))"))
+                    onEvent(.toolCall(step: step, name: call.name, arguments: call.argumentsJSON))
                     let output = await registry.run(call)
-                    onEvent(.init(text: "  ← \(output.prefix(300))"))
+                    onEvent(.toolResult(step: step, name: call.name, result: String(output.prefix(300))))
+                    if call.name == "screenshot",
+                       let url = output.split(separator: "\n").compactMap({ URL(string: "file://\($0.trimmingCharacters(in: .whitespaces))") }).first {
+                        onEvent(.screenshot(url))
+                    }
                     messages.append(.tool(result: output, callId: call.id))
                 }
             } catch {
-                onEvent(.init(text: "✗ step \(step) failed: \(error)"))
+                onEvent(.text("✗ step \(step) failed: \(error)"))
                 record.stoppedReason = "error: \(error)"
+                onEvent(.stopped(record.stoppedReason))
                 return record
             }
         }
 
         record.stoppedReason = "step-budget-exhausted"
-        onEvent(.init(text: "✗ step budget exhausted (\(config.maxSteps))"))
+        onEvent(.text("✗ step budget exhausted (\(config.maxSteps))"))
+        onEvent(.stopped(record.stoppedReason))
         return record
     }
 

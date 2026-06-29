@@ -66,10 +66,14 @@ A single Swift Package, one executable target. Keep the layout boring.
   (`https://api.cerebras.ai/v1`). No separate preview endpoint.
 - API key: `CEREBRAS_API_KEY` from the environment.
 - Reasoning is **off by default**. Set `reasoning_effort` to `low`/`medium`/
-  `high` to enable thinking. Use `none` for the action model in the speed race;
-  use `high` for the visual-verification step where reasoning helps.
+  `high` to enable thinking. The action model runs at `none` for speed.
+  `image_look` also uses `none`: high reasoning consumed the token budget and
+  returned empty content, so vision verification runs fast and reliable.
 - Image input: **base64 data URIs only** via `image_url` content blocks. No
   hosted image URLs (Cerebras does not accept them yet).
+- `screenshot` captures the **focused app's window** (cropped from a full-screen
+  capture to the window bounds) so `image_look` reads the right UI, not the
+  desktop. Falls back to full screen if no app is focused.
 - Hackathon elevated limits (for approved Org IDs): 100 RPM, 100K TPM, 65K MSL /
   32K MCL context. Access window: Sun Jun 28 10:30 AM PT → Mon Jun 29 10:00 AM PT.
 

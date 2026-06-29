@@ -154,24 +154,29 @@ final class ScreenshotTool: Tool {
         try write(image, to: url)
     }
 
-    /// Capture the on-screen window belonging to `pid` (largest by height).
+    /// Capture the on-screen window belonging to `pid`. We capture the full
+    /// screen at 1x and crop to the window's bounds — CGWindowListCreateImage's
+    /// single-windowID mode is unreliable on modern macOS.
     static func captureWindowImage(pid: pid_t) -> CGImage? {
+        let pidInt = Int(pid)
         guard let infos = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
             return nil
         }
-        var best: (wid: CGWindowID, height: Int) = (0, 0)
+        var best: CGRect = .null
         for w in infos {
-            guard let ownerPID = w[kCGWindowOwnerPID as String] as? Int, ownerPID == pid,
-                  let wid = w[kCGWindowNumber as String] as? Int,
-                  let bounds = w[kCGWindowBounds as String] as? [String: Any],
-                  let h = bounds["Height"] as? Int else { continue }
-            // Skip tiny menus/status items; prefer the tallest real window.
-            if h > 120 && h > best.height {
-                best = (CGWindowID(wid), h)
+            guard let ownerPID = w[kCGWindowOwnerPID as String] as? Int, ownerPID == pidInt,
+                  let b = w[kCGWindowBounds as String] as? [String: Any],
+                  let x = b["X"] as? Int, let y = b["Y"] as? Int,
+                  let bw = b["Width"] as? Int, let h = b["Height"] as? Int else { continue }
+            if h > 120 && h > Int(best.height) {
+                best = CGRect(x: x, y: y, width: bw, height: h)
             }
         }
-        guard best.wid != 0 else { return nil }
-        return CGWindowListCreateImage(.null, .optionOnScreenOnly, best.wid, [.nominalResolution])
+        guard best != .null else { return nil }
+        guard let full = CGWindowListCreateImage(.infinite, .optionOnScreenOnly, kCGNullWindowID, [.nominalResolution]) else {
+            return nil
+        }
+        return full.cropping(to: best)
     }
 
     static func write(_ image: CGImage, to url: URL) throws {

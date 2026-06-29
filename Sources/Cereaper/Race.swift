@@ -18,17 +18,17 @@ enum Race {
     static func run(prompt: String,
                     cerebras: CerebrasClient = CerebrasClient(),
                     gpuProvider: CerebrasClient? = nil,
-                    onEvent: @escaping (TranscriptEvent) -> Void) async -> [RaceResult] {
+                    onEvent: @escaping (RunEvent) -> Void) async -> [RaceResult] {
         var results: [RaceResult] = []
 
-        onEvent(.init(text: "🏁 Cerebras (gemma-4-31b)"))
+        onEvent(.text("🏁 Cerebras (gemma-4-31b)"))
         let agent = Agent(client: cerebras)
         let t0 = Date()
         let rec = await agent.run(task: prompt, onEvent: onEvent)
         results.append(RaceResult(provider: "Cerebras", record: rec, wallClockSeconds: Date().timeIntervalSince(t0)))
 
         if let gpu = gpuProvider {
-            onEvent(.init(text: "🏁 GPU provider (\(gpu.model))"))
+            onEvent(.text("🏁 GPU provider (\(gpu.model))"))
             let agent2 = Agent(client: gpu, registry: Agent.defaultRegistry(client: gpu))
             let t1 = Date()
             let rec2 = await agent2.run(task: prompt, onEvent: onEvent)
