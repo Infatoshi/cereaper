@@ -1,0 +1,42 @@
+---
+description: Cereaper build & safety conventions for the Gemma 4 hackathon
+globs: "**/*.swift"
+alwaysApply: true
+---
+
+# Cereaper conventions
+
+Cereaper is a native Swift macOS desktop agent. Read `AGENTS.md` for the full spec.
+
+## Architecture boundaries (do not cross casually)
+- `LLMModel.swift` — provider-neutral message/content-block/tool/timing model.
+- `CerebrasClient.swift` — Cerebras Chat Completions adapter only. Keep provider oddities here.
+- `Agent.swift` — the agent loop, step budget, fail-closed termination.
+- `Tools.swift` — tool protocol + `read`, `bash`, `write`, `edit`, `screenshot`, `image_look`, `computer_use`.
+- `ComputerUse.swift` — native macOS Accessibility API. AX-grounded, fail-closed.
+- `QA.swift` — hero build→run→drive→verify→report flow.
+- `Race.swift` — Cerebras-vs-GPU timing harness.
+- `App*` files — AppKit UI only. No agent logic here.
+
+## Gemma 4 on Cerebras
+- Model ID: `gemma-4-31b`. Endpoint: `https://api.cerebras.ai/v1`. Key: `CEREBRAS_API_KEY`.
+- Reasoning OFF by default. Set `reasoning_effort` (`low`/`medium`/`high`) only when needed; `none` keeps it off.
+- Image input: base64 data URIs via `image_url` blocks. No hosted image URLs.
+- Capture `time_info` (TTFT, tokens/sec) on every completion — the race harness depends on it.
+
+## Reliability defenses (build in from day one)
+- Strict tool-call-only outputs.
+- Hard step budget per run.
+- `final_answer` tool forces termination.
+- Stop sequences to truncate leaked reasoning.
+
+## Safety (non-negotiable)
+- Fail closed: if an AX target isn't exposed, stop and report. Never guess coordinates.
+- Confirmation gate before any irreversible action (submit/post/send/delete/file).
+- Demo with burner accounts. No secrets/notifications on screen.
+- AX-friendly apps only: Safari, Notes, Finder, Terminal, the agent's own generated app.
+- Always keep a pre-recorded fallback run for the live demo.
+
+## Build
+- `swift build` before declaring a change complete. `swift run` to launch. `swift test` for tests.
+- `tau-reference/` is inspiration only — gitignored, never imported or linked.
