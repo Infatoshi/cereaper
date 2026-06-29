@@ -53,13 +53,27 @@ enum AXGround {
         guard let running = app else { throw CereaperAXError.appNotFound(name) }
         running.activate(options: [.activateIgnoringOtherApps])
         Thread.sleep(forTimeInterval: 0.4)
-        return AXUIElementCreateApplication(running.processIdentifier)
+        let appEl = AXUIElementCreateApplication(running.processIdentifier)
+        // Nudge it to frontmost via AX too (background-launched apps often don't
+        // grab focus, which leaves kAXFocusedWindowAttribute empty).
+        AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue as CFTypeRef)
+        Thread.sleep(forTimeInterval: 0.2)
+        return appEl
     }
 
-    /// Build a bounded tree of the frontmost window of an app element.
+    /// Build a bounded tree of the frontmost window of an app element. Falls back
+    /// to the first window in kAXWindowsAttribute if no window reports as focused.
     static func frontmostWindowTree(_ app: AXUIElement, maxDepth: Int = 5, maxChildren: Int = 40) throws -> AXNode {
         var windowRef: CFTypeRef?
         AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowRef)
+        if windowRef == nil {
+            // Fall back to the windows list.
+            var windowsRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef)
+            if let arr = windowsRef as? [AXUIElement], let first = arr.first {
+                windowRef = first
+            }
+        }
         guard windowRef != nil else { throw CereaperAXError.noFocusedWindow }
         let window = windowRef as! AXUIElement
         var counter = 0
@@ -146,8 +160,10 @@ enum AXGround {
 
     private static func walk(_ node: AXNode, path: AXPath, out: inout [(Int, AXPath)]) {
         out.append((node.index, path))
-        for child in node.children {
-            walk(child, path: path + [child.index], out: &out)
+        for (pos, child) in node.children.enumerated() {
+            // Path uses the child's ARRAY POSITION within its parent's children,
+            // NOT its preorder index — resolve() indexes children by position.
+            walk(child, path: path + [pos], out: &out)
         }
     }
 
@@ -157,6 +173,13 @@ enum AXGround {
     private static func resolve(_ app: AXUIElement, path: AXPath) -> AXUIElement {
         var windowRef: CFTypeRef?
         AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &windowRef)
+        if windowRef == nil {
+            var windowsRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef)
+            if let arr = windowsRef as? [AXUIElement], let first = arr.first {
+                windowRef = first
+            }
+        }
         guard windowRef != nil else { return app }
         var current = windowRef as! AXUIElement
         for idx in path {

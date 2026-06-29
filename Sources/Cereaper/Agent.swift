@@ -19,9 +19,9 @@ struct RunRecord {
 }
 
 struct AgentConfig {
-    var maxSteps: Int = 16
+    var maxSteps: Int = 24
     var reasoningEffort: String = "none"  // action model: fast
-    var verifyReasoningEffort: String = "high"  // image_look uses high
+    var verifyReasoningEffort: String = "high"  // (unused; image_look uses none for speed)
     var temperature: Double = 0.2
 }
 
@@ -47,12 +47,12 @@ final class Agent {
 
     static func defaultRegistry(client: CerebrasClient) -> ToolRegistry {
         let r = ToolRegistry()
+        let session = ComputerUseSession()
         r.register(ReadTool())
         r.register(BashTool())
         r.register(WriteTool())
-        r.register(ScreenshotTool())
+        r.register(ScreenshotTool(session: session))
         r.register(ImageLookTool(client: client))
-        let session = ComputerUseSession()
         r.register(ComputerFocusTool(session: session))
         r.register(ComputerStateTool(session: session))
         r.register(ComputerClickTool(session: session))

@@ -7,29 +7,88 @@ import Foundation
 /// has a reliable, rehearsed starting prompt and so the Race harness can replay
 /// the same prompt across providers.
 enum QAFlow {
-    /// Prompt the agent runs for the hero demo. The target app is intentionally
-    /// simple and AX-friendly: a SwiftUI window with a text field and a button.
-    static let heroPrompt = """
-    Run a self-QA demo end to end, narrating each step via tool calls:
+    /// Prompt the agent runs for the hero demo. The target app is a known-good
+    /// AppKit program (compiles cleanly with swiftc, exposes AX reliably) that
+    /// ships with an intentional bug: the Greet button ignores the text field
+    /// and always shows "Hello, world!".
+    static let heroPrompt = #"""
+    Run a self-QA demo end to end, narrating each step via tool calls.
 
-    1. Write a tiny SwiftUI macOS app at /tmp/cereaper-qa/QAApp.swift with this behavior:
-       - A window titled "QA Target" with an NSTextField (placeholder "Type your name"),
-         a button titled "Greet", and a label below that shows nothing until clicked.
-       - When the button is clicked, the label should show "Hello, <name>!" using the
-         field's text. (Intentionally ship it with a bug: show "Hello, !" with an empty
-         name when the field is empty, but ALSO forget to read the field — just print
-         a hardcoded "Hello, world!" so the greeting is wrong for any typed name.)
-    2. Write a minimal build script at /tmp/cereaper-qa/build.sh that compiles QAApp.swift
-       into an app bundle at /tmp/cereaper-qa/QAApp.app using swiftc and runs it.
-    3. Run the build script with bash to launch QAApp.
-    4. Call computer_focus on "QAApp" (or the launched app name), then computer_state to
-       read the window's AX tree.
-    5. Use computer_set_value to type "Ada" into the text field, then computer_click on
-       the Greet button.
-    6. Take a screenshot and use image_look to verify what the label actually shows.
-    7. Report the bug you observed with the grounded element and the actual vs expected
-       label text, then call final_answer with the bug report.
-    """
+    1. Create the directory: bash `mkdir -p /tmp/cereaper-qa`.
+
+    2. Write this EXACT content to /tmp/cereaper-qa/QAApp.swift using the write tool:
+
+    ```swift
+    import Cocoa
+
+    @main
+    struct QAApp {
+        static func main() {
+            let app = NSApplication.shared
+            let delegate = QAAppDelegate()
+            app.delegate = delegate
+            app.setActivationPolicy(.regular)
+            app.activate(ignoringOtherApps: true)
+            app.run()
+        }
+    }
+
+    final class QAAppDelegate: NSObject, NSApplicationDelegate {
+        var window: NSWindow?
+        var nameField: NSTextField!
+        var greetButton: NSButton!
+        var label: NSTextField!
+
+        func applicationDidFinishLaunching(_ notification: Notification) {
+            let w = NSWindow(contentRect: NSRect(x: 240, y: 240, width: 340, height: 200),
+                             styleMask: [.titled, .closable, .miniaturizable],
+                             backing: .buffered, defer: false)
+            w.title = "QA Target"
+            nameField = NSTextField(frame: NSRect(x: 20, y: 140, width: 300, height: 24))
+            nameField.placeholderString = "Type your name"
+            greetButton = NSButton(frame: NSRect(x: 20, y: 100, width: 100, height: 32))
+            greetButton.title = "Greet"
+            greetButton.target = self
+            greetButton.action = #selector(greet)
+            label = NSTextField(frame: NSRect(x: 20, y: 60, width: 300, height: 24))
+            label.isEditable = false
+            label.isBordered = false
+            label.drawsBackground = false
+            label.stringValue = ""
+            w.contentView!.addSubview(nameField)
+            w.contentView!.addSubview(greetButton)
+            w.contentView!.addSubview(label)
+            w.makeKeyAndOrderFront(nil)
+            self.window = w
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        @objc func greet() {
+            // BUG: ignores nameField, always shows "Hello, world!"
+            label.stringValue = "Hello, world!"
+        }
+    }
+    ```
+
+    3. Build it with this EXACT command (bash):
+       `swiftc -parse-as-library -framework Cocoa /tmp/cereaper-qa/QAApp.swift -o /tmp/cereaper-qa/QAApp`
+
+    4. Launch it (bash): `/tmp/cereaper-qa/QAApp & sleep 1`
+
+    5. Call computer_focus with app "QAApp", then computer_state to read the
+       frontmost window's AX tree. Identify the text field (placeholder
+       "Type your name"), the "Greet" button, and the label by their indices.
+
+    6. Use computer_set_value to put "Ada" into the text field, then
+       computer_click on the "Greet" button.
+
+    7. Take a screenshot and use image_look with the question
+       "What exact text does the label at the bottom show?"
+
+    8. Compare the actual label text to the expected "Hello, Ada!". Report the
+       grounded bug (which element, actual vs expected), then call final_answer
+       with the bug report.
+    """#
 
     /// A simpler prompt for a first smoke test of the loop (no app-build).
     static let smokePrompt = """
