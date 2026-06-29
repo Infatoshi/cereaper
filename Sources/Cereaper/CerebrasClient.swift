@@ -5,7 +5,7 @@ import Foundation
 /// Model:    gemma-4-31b  (hackathon private preview; standard Cerebras API key)
 ///
 /// Reasoning is OFF by default on Gemma 4. Set `reasoningEffort` to low/medium/high
-/// to turn thinking on. Keep `none` for the action model in the speed race; use
+/// to turn thinking on. Use `none` for the action model in the speed race; use
 /// `high` for the visual-verification step where reasoning helps.
 ///
 /// Image input: base64 data URIs only, via image_url content blocks. No hosted URLs.
@@ -28,15 +28,20 @@ struct CerebrasClient {
 
     struct CompletionResult {
         let text: String
+        let toolCalls: [ToolCall]
         let usage: Usage?
         let timeInfo: TimeInfo?
+        var tokensPerSecond: Double? { timeInfo?.tokensPerSecond(completionTokens: usage?.completionTokens) }
     }
 
-    /// Non-streaming completion. Round one uses non-streaming; streaming is a later add.
+    /// Non-streaming completion with optional tool definitions. Round one uses
+    /// non-streaming; streaming is a later add.
     func complete(
         messages: [Message],
+        tools: [ToolSpec] = [],
         reasoningEffort: String = "none",
-        temperature: Double = 0.2
+        temperature: Double = 0.2,
+        maxTokens: Int = 2048
     ) async throws -> CompletionResult {
         guard isConfigured else { throw CerebrasError.missingAPIKey }
 
@@ -44,9 +49,13 @@ struct CerebrasClient {
             "model": model,
             "messages": messages.map(messageJSON),
             "temperature": temperature,
+            "max_tokens": maxTokens,
         ]
         if reasoningEffort != "none" {
             body["reasoning_effort"] = reasoningEffort
+        }
+        if !tools.isEmpty {
+            body["tools"] = tools.map { try! JSONSerialization.jsonObject(with: JSONEncoder().encode($0)) }
         }
 
         var request = URLRequest(url: baseURL.appendingPathComponent("chat/completions"))
@@ -56,30 +65,36 @@ struct CerebrasClient {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+        let http = response as? HTTPURLResponse
+        let code = http?.statusCode ?? -1
+        guard let http, (200..<300).contains(http.statusCode) else {
             let snippet = String(data: data, encoding: .utf8) ?? ""
-            throw CerebrasError.httpError(snippet)
+            throw CerebrasError.httpError(code, snippet)
         }
 
         let decoded = try JSONDecoder().decode(CompletionResponse.self, from: data)
-        let text = decoded.choices.first?.message.content ?? ""
-        return CompletionResult(text: text, usage: decoded.usage, timeInfo: decoded.timeInfo)
+        let choice = decoded.choices.first
+        let text = choice?.message.content ?? ""
+        let calls = (choice?.message.toolCalls ?? []).map { tc in
+            ToolCall(id: tc.id, name: tc.function.name, argumentsJSON: tc.function.arguments)
+        }
+        return CompletionResult(text: text, toolCalls: calls, usage: decoded.usage, timeInfo: decoded.timeInfo)
     }
 
-    /// Quick connectivity + latency probe. Prints tokens/sec from `time_info`.
+    /// Quick connectivity + latency probe.
     func ping() async throws -> CompletionResult {
         try await complete(
             messages: [.system("You are a ping responder."),
-                       .user([.text("Reply with exactly: pong")])],
+                       .userText("Reply with exactly: pong")],
             reasoningEffort: "none",
-            temperature: 0
+            temperature: 0,
+            maxTokens: 8
         )
     }
 
     private func messageJSON(_ m: Message) -> [String: Any] {
         let content: Any
         if m.content.count == 1, case .text = m.content[0].kind, let t = m.content[0].text {
-            // Single text block → send as plain string (most compatible).
             content = t
         } else {
             content = m.content.map { block -> [String: Any] in
@@ -92,14 +107,34 @@ struct CerebrasClient {
                 }
             }
         }
-        return ["role": m.role.rawValue, "content": content]
+        var obj: [String: Any] = ["role": m.role.rawValue, "content": content]
+        if let calls = m.toolCalls, !calls.isEmpty {
+            obj["tool_calls"] = calls.map { c in
+                ["id": c.id, "type": "function",
+                 "function": ["name": c.name, "arguments": c.argumentsJSON]]
+            }
+        }
+        if let id = m.toolCallId { obj["tool_call_id"] = id }
+        return obj
     }
 }
 
 private struct CompletionResponse: Codable {
     struct Choice: Codable {
-        struct Message: Codable { let content: String? }
+        struct Message: Codable {
+            let content: String?
+            let toolCalls: [RawToolCall]?
+            private enum CodingKeys: String, CodingKey {
+                case content
+                case toolCalls = "tool_calls"
+            }
+        }
         let message: Message
+    }
+    struct RawToolCall: Codable {
+        let id: String
+        let function: RawFunction
+        struct RawFunction: Codable { let name: String; let arguments: String }
     }
     let choices: [Choice]
     let usage: Usage?
@@ -112,5 +147,5 @@ private struct CompletionResponse: Codable {
 
 enum CerebrasError: Error {
     case missingAPIKey
-    case httpError(String)
+    case httpError(Int, String)
 }
