@@ -2,21 +2,20 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
-    private let appController = AppController()
+    private let workspace = WorkspaceController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let frame = NSRect(x: 0, y: 0, width: 1080, height: 680)
+        let frame = NSRect(x: 0, y: 0, width: 1180, height: 720)
         let window = NSWindow(
             contentRect: frame,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Cereaper"
-        window.titlebarAppearsTransparent = false
         window.center()
-        window.contentView = appController.view
-        window.minSize = NSSize(width: 880, height: 540)
+        window.contentView = workspace.view
+        window.minSize = NSSize(width: 980, height: 600)
         window.makeKeyAndOrderFront(nil)
 
         let toolbar = NSToolbar(identifier: "cereaper.toolbar")
@@ -39,8 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         edit.submenu = NSMenu(title: "Edit")
         edit.submenu?.addItem(withTitle: "Clear", action: #selector(AppController.clearTapped), keyEquivalent: "k")
         main?.addItem(edit)
-    }
-}
+    }}
 
 extension AppDelegate: NSToolbarDelegate {
     private enum Item: String {
@@ -83,7 +81,7 @@ extension AppDelegate: NSToolbarDelegate {
         default:
             return nil
         }
-        item.target = appController
+        item.target = workspace.runController
         item.isBordered = true
         return item
     }

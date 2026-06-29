@@ -15,9 +15,11 @@ struct StepRow {
 /// status bar. UI only; all agent behavior lives in the Agent module.
 final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
-    // MARK: surfaced for AppDelegate
+    // MARK: surfaced for AppDelegate + sibling views
     let view: NSView
     private(set) var stepRows: [StepRow] = []
+    private(set) var screenshotURLs: [URL] = []
+    private(set) var lastRecord: RunRecord?
 
     // MARK: sidebar
     private let taskTextView: NSTextView
@@ -450,6 +452,8 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
 
     @objc func clearTapped() {
         stepRows.removeAll()
+        screenshotURLs.removeAll()
+        lastRecord = nil
         stepsTable.reloadData()
         transcriptView.string = ""
         finalAnswerView.string = ""
@@ -469,6 +473,8 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         isRunning = true
         setRunUI(running: true)
         stepRows.removeAll()
+        screenshotURLs.removeAll()
+        lastRecord = nil
         stepsTable.reloadData()
         transcriptView.string = ""
         finalAnswerView.string = ""
@@ -479,10 +485,11 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
 
         Task.detached { [weak self] in
             guard let self else { return }
-            _ = await self.agent.run(task: task) { [weak self] event in
+            let record = await self.agent.run(task: task) { [weak self] event in
                 Task { @MainActor in self?.handle(event) }
             }
             await MainActor.run { [weak self] in
+                self?.lastRecord = record
                 self?.isRunning = false
                 self?.setRunUI(running: false)
                 self?.stopClock()
@@ -526,6 +533,7 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
             if last >= 0 { stepsTable.scrollRowToVisible(last) }
             refreshStatus()
         case .screenshot(let url):
+            screenshotURLs.append(url)
             if let img = NSImage(contentsOf: url) {
                 screenshotView.image = img
                 screenshotPlaceholder.isHidden = true
