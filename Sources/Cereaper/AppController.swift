@@ -1,346 +1,270 @@
 import AppKit
 import ApplicationServices
 
-/// A single row in the steps table.
-struct StepRow {
-    let step: Int
-    let tools: String
-    let ttft: String
-    let tps: String
-    var tokensPerSecond: Double?
+// MARK: - chat model
+
+struct ToolCard {
+    var name: String
+    var arguments: String
+    var result: String?
+    var image: NSImage?
 }
 
-/// AppController owns the Cereaper window content: a three-pane layout
-/// (sidebar · steps + transcript · screenshot + final answer) plus a live
-/// status bar. UI only; all agent behavior lives in the Agent module.
-final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+enum ChatItem {
+    case user(String)
+    case assistant(text: String, tools: [ToolCard])
+}
 
-    // MARK: surfaced for AppDelegate + sibling views
+// MARK: - theme
+
+private enum Theme {
+    static let bg          = NSColor(srgbRed: 0.110, green: 0.110, blue: 0.122, alpha: 1)
+    static let panel       = NSColor(srgbRed: 0.173, green: 0.173, blue: 0.184, alpha: 1)
+    static let bubbleUser  = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.000, alpha: 1)
+    static let bubbleAsst  = NSColor(srgbRed: 0.173, green: 0.173, blue: 0.184, alpha: 1)
+    static let card        = NSColor(srgbRed: 0.227, green: 0.227, blue: 0.235, alpha: 1)
+    static let cardBorder  = NSColor(srgbRed: 0.345, green: 0.345, blue: 0.353, alpha: 1)
+    static let text        = NSColor.white
+    static let textSub     = NSColor(srgbRed: 0.682, green: 0.682, blue: 0.710, alpha: 1)
+    static let textDim     = NSColor(srgbRed: 0.557, green: 0.557, blue: 0.580, alpha: 1)
+    static let accent      = NSColor(srgbRed: 0.039, green: 0.518, blue: 1.000, alpha: 1)
+    static let mono = { NSFont.monospacedSystemFont(ofSize: 11, weight: .regular) }
+    static let textFont = { NSFont.systemFont(ofSize: 13, weight: .regular) }
+}
+
+// MARK: - controller
+
+/// Chat UI: a conversation with user + assistant messages, tool calls rendered
+/// inline as cards (the tau-harness tools), a compose bar, and a dark theme.
+/// All agent behavior lives in the Agent module; this is UI only.
+final class AppController: NSObject, NSTextViewDelegate {
+
+    // exposed for AppDelegate + sibling views
     let view: NSView
     private(set) var stepRows: [StepRow] = []
     private(set) var screenshotURLs: [URL] = []
     private(set) var lastRecord: RunRecord?
 
-    // MARK: sidebar
-    private let taskTextView: NSTextView
-    private let taskScroll: NSScrollView
-    private let runButton: NSButton
-    private let stopButton: NSButton
+    private let messageStack: NSStackView
+    private let messageScroll: NSScrollView
+    private let composeField: NSTextView
+    private let composeScroll: NSScrollView
+    private let sendButton: NSButton
     private let smokeButton: NSButton
     private let qaButton: NSButton
-    private let axDot: NSView
-    private let axLabel: NSTextField
-    private let apiDot: NSView
-    private let apiLabel: NSTextField
-    private let modelLabel: NSTextField
-
-    // MARK: center
-    private let stepsTable: NSTableView
-    private let stepsScroll: NSScrollView
-    private let transcriptView: NSTextView
-    private let transcriptScroll: NSScrollView
-
-    // MARK: inspector
-    private let screenshotView: NSImageView
-    private let screenshotPlaceholder: NSTextField
-    private let finalAnswerView: NSTextView
-    private let finalAnswerScroll: NSScrollView
-
-    // MARK: status bar
+    private let clearButton: NSButton
     private let statusLeft: NSTextField
     private let statusCenter: NSTextField
     private let statusRight: NSTextField
+    private let axDot: NSView
+    private let apiDot: NSView
 
-    // MARK: state
     private let agent = Agent()
+    private var items: [ChatItem] = []
+    private var currentAssistant: Int? = nil
     private var isRunning = false
     private var runStart: Date?
     private var clockTimer: Timer?
 
+    private let bubbleMaxWidth: CGFloat = 560
+
     override init() {
-        taskTextView = NSTextView()
-        taskScroll = NSScrollView()
-        runButton = NSButton(title: "Run", target: nil, action: nil)
-        stopButton = NSButton(title: "Stop", target: nil, action: nil)
+        messageStack = NSStackView()
+        messageScroll = NSScrollView()
+        composeField = NSTextView()
+        composeScroll = NSScrollView()
+        sendButton = NSButton(title: "Send", target: nil, action: nil)
         smokeButton = NSButton(title: "Smoke", target: nil, action: nil)
         qaButton = NSButton(title: "QA demo", target: nil, action: nil)
-        axDot = NSView()
-        axLabel = NSTextField(labelWithString: "")
-        apiDot = NSView()
-        apiLabel = NSTextField(labelWithString: "")
-        modelLabel = NSTextField(labelWithString: "")
-        stepsTable = NSTableView()
-        stepsScroll = NSScrollView()
-        transcriptView = NSTextView()
-        transcriptScroll = NSScrollView()
-        screenshotView = NSImageView()
-        screenshotPlaceholder = NSTextField(labelWithString: "No screenshot yet")
-        finalAnswerView = NSTextView()
-        finalAnswerScroll = NSScrollView()
+        clearButton = NSButton(title: "New chat", target: nil, action: nil)
         statusLeft = NSTextField(labelWithString: "")
         statusCenter = NSTextField(labelWithString: "")
         statusRight = NSTextField(labelWithString: "")
+        axDot = NSView()
+        apiDot = NSView()
         view = NSView()
         super.init()
         build()
         wire()
         refreshStatus()
+        if !AXPermission.check() { AXPermission.request() }
     }
 
     // MARK: - build
 
     private func build() {
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        view.layer?.backgroundColor = Theme.bg.cgColor
 
-        let split = NSSplitView()
-        split.translatesAutoresizingMaskIntoConstraints = false
-        split.dividerStyle = .thin
-        split.isVertical = true
-        split.addSubview(sidebarView())
-        split.addSubview(centerView())
-        split.addSubview(inspectorView())
-        split.setPosition(270, ofDividerAt: 0)
-
+        let header = headerBar()
+        let compose = composeBar()
         let status = statusBar()
 
-        view.addSubview(split)
+        messageStack.orientation = .vertical
+        messageStack.alignment = .leading
+        messageStack.spacing = 14
+        messageStack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
+        messageStack.translatesAutoresizingMaskIntoConstraints = false
+        messageStack.widthAnchor.constraint(equalToConstant: 0).isActive = false
+
+        messageScroll.documentView = messageStack
+        messageScroll.hasVerticalScroller = true
+        messageScroll.drawsBackground = false
+        messageScroll.translatesAutoresizingMaskIntoConstraints = false
+        messageScroll.borderType = .noBorder
+        messageScroll.scrollerStyle = .overlay
+
+        view.addSubview(header)
+        view.addSubview(messageScroll)
+        view.addSubview(compose)
         view.addSubview(status)
 
         NSLayoutConstraint.activate([
-            split.topAnchor.constraint(equalTo: view.topAnchor),
-            split.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            split.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            split.bottomAnchor.constraint(equalTo: status.topAnchor),
+            header.topAnchor.constraint(equalTo: view.topAnchor),
+            header.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: 44),
+
+            messageScroll.topAnchor.constraint(equalTo: header.bottomAnchor),
+            messageScroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            messageScroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            messageScroll.bottomAnchor.constraint(equalTo: compose.topAnchor),
+
+            compose.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            compose.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            compose.bottomAnchor.constraint(equalTo: status.topAnchor),
 
             status.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             status.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             status.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             status.heightAnchor.constraint(equalToConstant: 26),
         ])
-    }
 
-    // MARK: sidebar
-
-    private func sidebarView() -> NSView {
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-
-        let header = sectionHeader("TASK")
-        configureEditor(taskTextView, placeholder: "Describe a desktop task for Cereaper…")
-        taskTextView.font = .systemFont(ofSize: 13, weight: .regular)
-        taskTextView.isRichText = false
-        taskScroll.documentView = taskTextView
-        taskScroll.hasVerticalScroller = true
-        taskScroll.translatesAutoresizingMaskIntoConstraints = false
-        taskScroll.drawsBackground = false
-        taskScroll.borderType = .bezelBorder
-
-        styleButton(runButton, emphasized: true)
-        styleButton(stopButton, emphasized: false)
-        stopButton.isEnabled = false
-        styleButton(smokeButton, emphasized: false)
-        styleButton(qaButton, emphasized: false)
-
-        let presetRow = NSStackView(views: [smokeButton, qaButton])
-        presetRow.orientation = .horizontal
-        presetRow.spacing = 8
-        presetRow.translatesAutoresizingMaskIntoConstraints = false
-
-        let statusHeader = sectionHeader("STATUS")
-        axDot.wantsLayer = true
-        apiDot.wantsLayer = true
-        axLabel.font = .systemFont(ofSize: 11)
-        apiLabel.font = .systemFont(ofSize: 11)
-        modelLabel.font = .systemFont(ofSize: 11)
-        modelLabel.stringValue = "gemma-4-31b · reasoning: none"
-
-        let axRow = statusRow(dot: axDot, label: axLabel)
-        let apiRow = statusRow(dot: apiDot, label: apiLabel)
-
-        container.addSubview(header)
-        container.addSubview(taskScroll)
-        container.addSubview(presetRow)
-        container.addSubview(runButton)
-        container.addSubview(stopButton)
-        container.addSubview(statusHeader)
-        container.addSubview(axRow)
-        container.addSubview(apiRow)
-        container.addSubview(modelLabel)
-
-        let g = container.leadingAnchor
+        // Width-tracker so the stack hugs the scroll width (lets bubbles right-align).
+        let widthTracker = NSView()
+        widthTracker.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(widthTracker)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: container.topAnchor, constant: 14),
-            header.leadingAnchor.constraint(equalTo: g, constant: 16),
-
-            taskScroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
-            taskScroll.leadingAnchor.constraint(equalTo: g, constant: 12),
-            taskScroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            taskScroll.heightAnchor.constraint(equalToConstant: 120),
-
-            presetRow.topAnchor.constraint(equalTo: taskScroll.bottomAnchor, constant: 10),
-            presetRow.leadingAnchor.constraint(equalTo: g, constant: 12),
-
-            runButton.topAnchor.constraint(equalTo: presetRow.bottomAnchor, constant: 10),
-            runButton.leadingAnchor.constraint(equalTo: g, constant: 12),
-            runButton.widthAnchor.constraint(equalToConstant: 96),
-
-            stopButton.centerYAnchor.constraint(equalTo: runButton.centerYAnchor),
-            stopButton.leadingAnchor.constraint(equalTo: runButton.trailingAnchor, constant: 8),
-
-            statusHeader.topAnchor.constraint(equalTo: runButton.bottomAnchor, constant: 18),
-            statusHeader.leadingAnchor.constraint(equalTo: g, constant: 16),
-
-            axRow.topAnchor.constraint(equalTo: statusHeader.bottomAnchor, constant: 6),
-            axRow.leadingAnchor.constraint(equalTo: g, constant: 14),
-            axRow.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-
-            apiRow.topAnchor.constraint(equalTo: axRow.bottomAnchor, constant: 6),
-            apiRow.leadingAnchor.constraint(equalTo: axRow.leadingAnchor),
-            apiRow.trailingAnchor.constraint(equalTo: axRow.trailingAnchor),
-
-            modelLabel.topAnchor.constraint(equalTo: apiRow.bottomAnchor, constant: 6),
-            modelLabel.leadingAnchor.constraint(equalTo: g, constant: 14),
+            widthTracker.topAnchor.constraint(equalTo: messageScroll.topAnchor),
+            widthTracker.leadingAnchor.constraint(equalTo: messageScroll.leadingAnchor, constant: 18),
+            widthTracker.trailingAnchor.constraint(equalTo: messageScroll.trailingAnchor, constant: -18),
+            widthTracker.heightAnchor.constraint(equalToConstant: 0),
         ])
-
-        return container
+        messageStack.widthAnchor.constraint(equalTo: widthTracker.widthAnchor).isActive = true
     }
 
-    // MARK: center
+    private func headerBar() -> NSView {
+        let bar = NSView()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = Theme.bg.cgColor
+        bar.translatesAutoresizingMaskIntoConstraints = false
 
-    private func centerView() -> NSView {
-        let container = NSView()
-        let stepsHeader = sectionHeader("STEPS")
+        let title = NSTextField(labelWithString: "Cereaper")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        title.textColor = .white
 
-        stepsTable.dataSource = self
-        stepsTable.delegate = self
-        stepsTable.headerView = nil
-        stepsTable.rowHeight = 22
-        stepsTable.backgroundColor = .clear
-        stepsTable.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
-        let cols = ["step", "tools", "ttft", "tps"]
-        let widths: [CGFloat] = [40, 150, 70, 80]
-        for (i, id) in cols.enumerated() {
-            let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
-            c.width = widths[i]
-            c.minWidth = widths[i] * 0.6
-            stepsTable.addTableColumn(c)
+        let model = NSTextField(labelWithString: "gemma-4-31b · Cerebras")
+        model.translatesAutoresizingMaskIntoConstraints = false
+        model.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        model.textColor = Theme.textDim
+
+        for b in [smokeButton, qaButton, clearButton] {
+            b.translatesAutoresizingMaskIntoConstraints = false
+            b.bezelStyle = .roundRect
+            b.controlSize = .small
+            b.contentTintColor = Theme.textSub
         }
-        stepsScroll.documentView = stepsTable
-        stepsScroll.hasVerticalScroller = true
-        stepsScroll.translatesAutoresizingMaskIntoConstraints = false
-        stepsScroll.drawsBackground = false
-        stepsScroll.borderType = .noBorder
+        sendButton.title = "Send"
+        sendButton.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.bezelStyle = .regularSquare
+        sendButton.controlSize = .small
+        sendButton.keyEquivalent = "\r"
 
-        let transcriptHeader = sectionHeader("TRANSCRIPT")
-        configureEditor(transcriptView, placeholder: "")
-        transcriptView.isEditable = false
-        transcriptView.isRichText = false
-        transcriptView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        transcriptScroll.documentView = transcriptView
-        transcriptScroll.hasVerticalScroller = true
-        transcriptScroll.translatesAutoresizingMaskIntoConstraints = false
-        transcriptScroll.drawsBackground = false
+        bar.addSubview(title)
+        bar.addSubview(model)
+        bar.addSubview(smokeButton)
+        bar.addSubview(qaButton)
+        bar.addSubview(clearButton)
 
-        container.addSubview(stepsHeader)
-        container.addSubview(stepsScroll)
-        container.addSubview(transcriptHeader)
-        container.addSubview(transcriptScroll)
-
-        let g = container.leadingAnchor
         NSLayoutConstraint.activate([
-            stepsHeader.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
-            stepsHeader.leadingAnchor.constraint(equalTo: g, constant: 14),
+            title.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            title.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 18),
 
-            stepsScroll.topAnchor.constraint(equalTo: stepsHeader.bottomAnchor, constant: 6),
-            stepsScroll.leadingAnchor.constraint(equalTo: g, constant: 12),
-            stepsScroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            stepsScroll.heightAnchor.constraint(equalToConstant: 168),
+            model.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            model.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 10),
 
-            transcriptHeader.topAnchor.constraint(equalTo: stepsScroll.bottomAnchor, constant: 14),
-            transcriptHeader.leadingAnchor.constraint(equalTo: g, constant: 14),
+            clearButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            clearButton.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -14),
 
-            transcriptScroll.topAnchor.constraint(equalTo: transcriptHeader.bottomAnchor, constant: 6),
-            transcriptScroll.leadingAnchor.constraint(equalTo: g, constant: 12),
-            transcriptScroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            transcriptScroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            qaButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            qaButton.trailingAnchor.constraint(equalTo: clearButton.leadingAnchor, constant: -8),
+
+            smokeButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            smokeButton.trailingAnchor.constraint(equalTo: qaButton.leadingAnchor, constant: -8),
         ])
-
-        return container
+        return bar
     }
 
-    // MARK: inspector
+    private func composeBar() -> NSView {
+        let bar = NSView()
+        bar.wantsLayer = true
+        bar.layer?.backgroundColor = Theme.bg.cgColor
+        bar.translatesAutoresizingMaskIntoConstraints = false
 
-    private func inspectorView() -> NSView {
-        let container = NSView()
-        container.wantsLayer = true
-        container.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        composeField.delegate = self
+        composeField.font = Theme.textFont()
+        composeField.isRichText = false
+        composeField.drawsBackground = true
+        composeField.backgroundColor = Theme.panel
+        composeField.textColor = .white
+        composeField.insertionPointColor = .white
+        composeField.textContainerInset = NSSize(width: 8, height: 6)
+        composeField.autoresizingMask = [.width]
+        composeField.textContainer?.widthTracksTextView = true
+        composeField.isVerticallyResizable = true
+        composeField.isHorizontallyResizable = false
 
-        let shotHeader = sectionHeader("SCREENSHOT")
-        screenshotView.imageScaling = .scaleProportionallyUpOrDown
-        screenshotView.imageAlignment = .alignCenter
-        screenshotView.wantsLayer = true
-        screenshotView.layer?.borderColor = NSColor.separatorColor.cgColor
-        screenshotView.layer?.borderWidth = 1
-        screenshotView.translatesAutoresizingMaskIntoConstraints = false
+        composeScroll.documentView = composeField
+        composeScroll.translatesAutoresizingMaskIntoConstraints = false
+        composeScroll.hasVerticalScroller = true
+        composeScroll.drawsBackground = false
+        composeScroll.wantsLayer = true
+        composeScroll.layer?.cornerRadius = 8
+        composeScroll.layer?.backgroundColor = Theme.panel.cgColor
 
-        screenshotPlaceholder.font = .systemFont(ofSize: 12)
-        screenshotPlaceholder.textColor = .secondaryLabelColor
-        screenshotPlaceholder.alignment = .center
-        screenshotPlaceholder.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.title = "Send"
+        sendButton.bezelStyle = .regularSquare
+        sendButton.controlSize = .regular
+        sendButton.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.contentTintColor = .white
 
-        let finalHeader = sectionHeader("FINAL ANSWER")
-        configureEditor(finalAnswerView, placeholder: "")
-        finalAnswerView.isEditable = false
-        finalAnswerView.isRichText = false
-        finalAnswerView.font = .systemFont(ofSize: 12, weight: .medium)
-        finalAnswerScroll.documentView = finalAnswerView
-        finalAnswerScroll.hasVerticalScroller = true
-        finalAnswerScroll.translatesAutoresizingMaskIntoConstraints = false
-        finalAnswerScroll.drawsBackground = false
+        bar.addSubview(composeScroll)
+        bar.addSubview(sendButton)
 
-        container.addSubview(shotHeader)
-        container.addSubview(screenshotView)
-        container.addSubview(screenshotPlaceholder)
-        container.addSubview(finalHeader)
-        container.addSubview(finalAnswerScroll)
-
-        let g = container.leadingAnchor
         NSLayoutConstraint.activate([
-            shotHeader.topAnchor.constraint(equalTo: container.topAnchor, constant: 12),
-            shotHeader.leadingAnchor.constraint(equalTo: g, constant: 14),
+            composeScroll.topAnchor.constraint(equalTo: bar.topAnchor, constant: 10),
+            composeScroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 16),
+            composeScroll.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -10),
+            composeScroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -10),
+            composeScroll.heightAnchor.constraint(equalToConstant: 56),
 
-            screenshotView.topAnchor.constraint(equalTo: shotHeader.bottomAnchor, constant: 6),
-            screenshotView.leadingAnchor.constraint(equalTo: g, constant: 12),
-            screenshotView.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            screenshotView.heightAnchor.constraint(equalTo: screenshotView.widthAnchor, multiplier: 0.62),
-
-            screenshotPlaceholder.centerXAnchor.constraint(equalTo: screenshotView.centerXAnchor),
-            screenshotPlaceholder.centerYAnchor.constraint(equalTo: screenshotView.centerYAnchor),
-
-            finalHeader.topAnchor.constraint(equalTo: screenshotView.bottomAnchor, constant: 14),
-            finalHeader.leadingAnchor.constraint(equalTo: g, constant: 14),
-
-            finalAnswerScroll.topAnchor.constraint(equalTo: finalHeader.bottomAnchor, constant: 6),
-            finalAnswerScroll.leadingAnchor.constraint(equalTo: g, constant: 12),
-            finalAnswerScroll.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
-            finalAnswerScroll.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -12),
+            sendButton.centerYAnchor.constraint(equalTo: composeScroll.centerYAnchor),
+            sendButton.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -16),
+            sendButton.widthAnchor.constraint(equalToConstant: 80),
         ])
-
-        return container
+        return bar
     }
-
-    // MARK: status bar
 
     private func statusBar() -> NSView {
         let bar = NSView()
         bar.wantsLayer = true
-        bar.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        bar.layer?.backgroundColor = Theme.panel.cgColor
+        bar.translatesAutoresizingMaskIntoConstraints = false
 
         for l in [statusLeft, statusCenter, statusRight] {
             l.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-            l.textColor = .secondaryLabelColor
+            l.textColor = Theme.textDim
             l.translatesAutoresizingMaskIntoConstraints = false
             bar.addSubview(l)
         }
@@ -348,118 +272,83 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         statusCenter.alignment = .center
         statusRight.alignment = .right
 
-        let top = NSView()
-        top.translatesAutoresizingMaskIntoConstraints = false
-        top.wantsLayer = true
-        top.layer?.backgroundColor = NSColor.separatorColor.cgColor
-        bar.addSubview(top)
+        for d in [axDot, apiDot] {
+            d.translatesAutoresizingMaskIntoConstraints = false
+            d.wantsLayer = true
+            d.layer?.cornerRadius = 4
+            d.widthAnchor.constraint(equalToConstant: 7).isActive = true
+            d.heightAnchor.constraint(equalToConstant: 7).isActive = true
+            bar.addSubview(d)
+        }
 
         NSLayoutConstraint.activate([
-            top.topAnchor.constraint(equalTo: bar.topAnchor),
-            top.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
-            top.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
-            top.heightAnchor.constraint(equalToConstant: 1),
-
+            axDot.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            axDot.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
             statusLeft.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
-            statusLeft.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
+            statusLeft.leadingAnchor.constraint(equalTo: axDot.trailingAnchor, constant: 6),
+
+            apiDot.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+            apiDot.leadingAnchor.constraint(equalTo: statusLeft.trailingAnchor, constant: 14),
+            statusRight.leadingAnchor.constraint(equalTo: apiDot.trailingAnchor, constant: 6),
+            statusRight.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+
             statusCenter.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
             statusCenter.centerXAnchor.constraint(equalTo: bar.centerXAnchor),
-            statusRight.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+
             statusRight.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
         ])
         return bar
     }
 
-    // MARK: - small view helpers
-
-    private func sectionHeader(_ s: String) -> NSTextField {
-        let l = NSTextField(labelWithString: s)
-        l.translatesAutoresizingMaskIntoConstraints = false
-        l.font = .systemFont(ofSize: 10, weight: .semibold)
-        l.textColor = .tertiaryLabelColor
-        return l
-    }
-
-    private func styleButton(_ b: NSButton, emphasized: Bool) {
-        b.translatesAutoresizingMaskIntoConstraints = false
-        b.bezelStyle = emphasized ? .regularSquare : .roundRect
-        b.controlSize = .small
-        if emphasized { b.keyEquivalent = "\r" }
-    }
-
-    private func configureEditor(_ tv: NSTextView, placeholder: String) {
-        tv.isSelectable = true
-        tv.autoresizingMask = [.width]
-        tv.textContainer?.widthTracksTextView = true
-        tv.textContainerInset = NSSize(width: 4, height: 4)
-        tv.drawsBackground = true
-        tv.backgroundColor = NSColor.textBackgroundColor
-    }
-
-    private func statusRow(dot: NSView, label: NSTextField) -> NSStackView {
-        dot.translatesAutoresizingMaskIntoConstraints = false
-        dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
-        dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
-        dot.layer?.cornerRadius = 4
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let row = NSStackView(views: [dot, label])
-        row.orientation = .horizontal
-        row.spacing = 6
-        row.alignment = .centerY
-        row.translatesAutoresizingMaskIntoConstraints = false
-        return row
-    }
-
-    private func setDot(_ v: NSView, on: Bool) {
-        v.layer?.backgroundColor = (on ? NSColor.systemGreen : NSColor.systemRed).cgColor
-    }
-
     // MARK: - wiring
 
     private func wire() {
-        runButton.target = self
-        runButton.action = #selector(runTapped)
-        stopButton.target = self
-        stopButton.action = #selector(stopTapped)
+        sendButton.target = self
+        sendButton.action = #selector(runTapped)
         smokeButton.target = self
         smokeButton.action = #selector(smokeTapped)
         qaButton.target = self
         qaButton.action = #selector(qaTapped)
+        clearButton.target = self
+        clearButton.action = #selector(clearTapped)
     }
 
-    @objc func smokeTapped() {
-        taskTextView.string = QAFlow.smokePrompt
+    func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        // Cmd+Enter sends
+        if commandSelector == #selector(NSTextView.insertNewline(_:)),
+           NSEvent.modifierFlags.contains(.command) {
+            runTapped()
+            return true
+        }
+        return false
     }
 
-    @objc func qaTapped() {
-        taskTextView.string = QAFlow.heroPrompt
-    }
+    @objc func smokeTapped() { sendImmediately(QAFlow.smokePrompt) }
+    @objc func qaTapped() { sendImmediately(QAFlow.heroPrompt) }
 
     @objc func stopTapped() {
-        // Best-effort: the loop has no cancellation token yet; disable UI to signal intent.
         isRunning = false
         setRunUI(running: false)
-        appendTranscript("▸ stop requested (current step will finish)")
+        appendAssistantText("▸ stop requested (current step will finish)")
     }
 
     @objc func runTapped() {
-        guard !isRunning else { return }
-        let task = taskTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !task.isEmpty else { return }
-        startRun(task: task)
+        let text = composeField.string
+        guard !text.isEmpty else { return }
+        composeField.string = ""
+        send(text)
     }
 
     @objc func clearTapped() {
+        guard !isRunning else { return }
+        agent.resetConversation()
+        items.removeAll()
         stepRows.removeAll()
         screenshotURLs.removeAll()
         lastRecord = nil
-        stepsTable.reloadData()
-        transcriptView.string = ""
-        finalAnswerView.string = ""
-        screenshotView.image = nil
-        screenshotPlaceholder.isHidden = false
-        statusCenter.stringValue = ""
+        currentAssistant = nil
+        render()
+        refreshStatus()
     }
 
     @objc func permissionsTapped() {
@@ -467,120 +356,306 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         refreshStatus()
     }
 
-    // MARK: - run
+    // MARK: - send
 
-    private func startRun(task: String) {
+    private func sendImmediately(_ text: String) {
+        guard !isRunning else { return }
+        send(text)
+    }
+
+    private func send(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, !isRunning else { return }
         isRunning = true
         setRunUI(running: true)
-        stepRows.removeAll()
-        screenshotURLs.removeAll()
-        lastRecord = nil
-        stepsTable.reloadData()
-        transcriptView.string = ""
-        finalAnswerView.string = ""
-        screenshotView.image = nil
-        screenshotPlaceholder.isHidden = false
+        items.append(.user(t))
+        items.append(.assistant(text: "", tools: []))
+        currentAssistant = items.count - 1
+        render()
         runStart = Date()
         startClock()
 
         Task.detached { [weak self] in
             guard let self else { return }
-            let record = await self.agent.run(task: task) { [weak self] event in
+            let record = await self.agent.send(t) { [weak self] event in
                 Task { @MainActor in self?.handle(event) }
             }
             await MainActor.run { [weak self] in
                 self?.lastRecord = record
                 self?.isRunning = false
+                self?.currentAssistant = nil
                 self?.setRunUI(running: false)
                 self?.stopClock()
-                self?.appendTranscript("▸ done")
             }
         }
     }
 
     private func setRunUI(running: Bool) {
-        runButton.isEnabled = !running
-        stopButton.isEnabled = running
+        sendButton.isEnabled = !running
         smokeButton.isEnabled = !running
         qaButton.isEnabled = !running
+        clearButton.isEnabled = !running
     }
 
-    // MARK: - events
+    // MARK: - events → chat model
 
     private func handle(_ event: RunEvent) {
         switch event {
-        case .task(let t):
-            appendTranscript("▸ task: \(t)")
+        case .task:
+            break // already added the user bubble in send()
         case .text(let s):
-            appendTranscript(s)
+            appendAssistantText(s)
         case .status(let s):
-            appendTranscript(s)
-        case .toolCall(_, let n, let a):
-            appendTranscript("  → \(n)(\(a))")
-        case .toolResult(_, let n, let r):
-            appendTranscript("  ← \(n): \(r)")
+            appendAssistantText(s)
+        case .toolCall(_, let name, let args):
+            appendToolCard(ToolCard(name: name, arguments: args, result: nil, image: nil))
+        case .toolResult(_, let name, let result):
+            fillToolResult(name: name, result: result)
+        case .screenshot(let url):
+            screenshotURLs.append(url)
+            if let img = NSImage(contentsOf: url) { attachScreenshot(img) }
         case .timing(let step, let ttft, let tps, let tools):
-            let row = StepRow(
+            stepRows.append(StepRow(
                 step: step,
                 tools: tools.joined(separator: ","),
                 ttft: ttft.map { String(format: "%.0fms", $0 * 1000) } ?? "—",
                 tps: tps.map { String(format: "%.0f", $0) } ?? "—",
                 tokensPerSecond: tps
-            )
-            stepRows.append(row)
-            stepsTable.reloadData()
-            let last = stepRows.count - 1
-            if last >= 0 { stepsTable.scrollRowToVisible(last) }
+            ))
             refreshStatus()
-        case .screenshot(let url):
-            screenshotURLs.append(url)
-            if let img = NSImage(contentsOf: url) {
-                screenshotView.image = img
-                screenshotPlaceholder.isHidden = true
-            }
         case .finalAnswer(let s):
-            finalAnswerView.string = s
-        case .stopped(let s):
-            appendTranscript("▸ stopped: \(s)")
+            let summary = extractSummary(s)
+            appendAssistantText(summary)
+        case .stopped:
+            render()
+        }
+        render()
+    }
+
+    private func appendAssistantText(_ s: String) {
+        guard let idx = currentAssistant, case .assistant(var text, let tools) = items[idx] else { return }
+        if text.isEmpty { text = s } else { text += "\n" + s }
+        items[idx] = .assistant(text: text, tools: tools)
+    }
+
+    private func appendToolCard(_ card: ToolCard) {
+        guard let idx = currentAssistant, case .assistant(let text, var tools) = items[idx] else { return }
+        tools.append(card)
+        items[idx] = .assistant(text: text, tools: tools)
+    }
+
+    private func fillToolResult(name: String, result: String) {
+        guard let idx = currentAssistant, case .assistant(let text, var tools) = items[idx] else { return }
+        for i in tools.indices.indices.reversed() {
+            if tools[i].name == name && tools[i].result == nil {
+                tools[i].result = result
+                break
+            }
+        }
+        items[idx] = .assistant(text: text, tools: tools)
+    }
+
+    private func attachScreenshot(_ image: NSImage) {
+        guard let idx = currentAssistant, case .assistant(let text, var tools) = items[idx] else { return }
+        for i in tools.indices.reversed() {
+            if tools[i].name == "screenshot" && tools[i].image == nil {
+                tools[i].image = image
+                break
+            }
+        }
+        items[idx] = .assistant(text: text, tools: tools)
+    }
+
+    private func extractSummary(_ json: String) -> String {
+        if let data = json.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let s = obj["summary"] as? String { return s }
+        return json
+    }
+
+    // MARK: - render
+
+    private func render() {
+        messageStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for item in items {
+            messageStack.addArrangedSubview(row(for: item))
+        }
+        // scroll to bottom
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let h = self.messageStack.bounds.height
+            let bottom = NSRect(x: 0, y: max(0, h - 1), width: 1, height: 1)
+            self.messageScroll.contentView.scrollToVisible(bottom)
         }
     }
 
-    // MARK: - table view
+    private func row(for item: ChatItem) -> NSView {
+        switch item {
+        case .user(let text):
+            return userRow(text)
+        case .assistant(let text, let tools):
+            return assistantRow(text: text, tools: tools)
+        }
+    }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { stepRows.count }
+    private func userRow(_ text: String) -> NSView {
+        let bubble = wrappingLabel(text, font: Theme.textFont(), color: .white,
+                                   maxWidth: bubbleMaxWidth, background: Theme.bubbleUser)
+        bubble.layer?.cornerRadius = 12
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [spacer, bubble])
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
 
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < stepRows.count, let id = tableColumn?.identifier.rawValue else { return nil }
-        let r = stepRows[row]
-        let cell = NSTableCellView()
-        let tf = NSTextField(labelWithString: "")
-        tf.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        tf.translatesAutoresizingMaskIntoConstraints = false
-        cell.addSubview(tf)
+    private func assistantRow(text: String, tools: [ToolCard]) -> NSView {
+        let col = NSStackView()
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 8
+        col.translatesAutoresizingMaskIntoConstraints = false
+
+        let avatar = NSTextField(labelWithString: "✦ Cereaper")
+        avatar.font = .systemFont(ofSize: 11, weight: .semibold)
+        avatar.textColor = Theme.accent
+        col.addArrangedSubview(avatar)
+
+        if !text.isEmpty {
+            let body = wrappingLabel(text, font: Theme.textFont(), color: Theme.text,
+                                     maxWidth: bubbleMaxWidth, background: nil)
+            col.addArrangedSubview(body)
+        }
+        for card in tools {
+            col.addArrangedSubview(toolCardView(card))
+        }
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [col, spacer])
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        return row
+    }
+
+    private func toolCardView(_ card: ToolCard) -> NSView {
+        let box = NSView()
+        box.wantsLayer = true
+        box.layer?.backgroundColor = Theme.card.cgColor
+        box.layer?.borderColor = Theme.cardBorder.cgColor
+        box.layer?.borderWidth = 1
+        box.layer?.cornerRadius = 8
+        box.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "wrench.and.screwdriver", accessibilityDescription: card.name)
+        icon.contentTintColor = Theme.textSub
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 14).isActive = true
+
+        let name = NSTextField(labelWithString: card.name)
+        name.font = .systemFont(ofSize: 12, weight: .semibold)
+        name.textColor = .white
+        name.translatesAutoresizingMaskIntoConstraints = false
+
+        let status = NSTextField(labelWithString: card.result == nil ? "running…" : "done")
+        status.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        status.textColor = card.result == nil ? Theme.textDim : Theme.accent
+        status.translatesAutoresizingMaskIntoConstraints = false
+
+        let header = NSStackView(views: [icon, name, NSView(), status])
+        header.orientation = .horizontal
+        header.spacing = 6
+        header.alignment = .centerY
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        let col = NSStackView()
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 6
+        col.translatesAutoresizingMaskIntoConstraints = false
+        col.addArrangedSubview(header)
+
+        if !card.arguments.isEmpty, card.arguments != "{}" {
+            let shown = card.arguments.count > 160
+                ? String(card.arguments.prefix(160)) + " …" : card.arguments
+            col.addArrangedSubview(codeLabel(shown, color: Theme.textSub))
+        }
+        if let result = card.result {
+            col.addArrangedSubview(codeLabel(String(result.prefix(400)), color: Theme.textSub))
+        }
+        if let image = card.image {
+            let iv = NSImageView()
+            iv.image = image
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.heightAnchor.constraint(lessThanOrEqualToConstant: 200).isActive = true
+            iv.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth - 24).isActive = true
+            iv.wantsLayer = true
+            iv.layer?.cornerRadius = 6
+            iv.layer?.borderColor = Theme.cardBorder.cgColor
+            iv.layer?.borderWidth = 1
+            col.addArrangedSubview(iv)
+        }
+
+        box.addSubview(col)
         NSLayoutConstraint.activate([
-            tf.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 6),
-            tf.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            col.topAnchor.constraint(equalTo: box.topAnchor, constant: 10),
+            col.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 12),
+            col.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -12),
+            col.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -10),
+            box.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth),
         ])
-        switch id {
-        case "step": tf.stringValue = "\(r.step)"; tf.textColor = .tertiaryLabelColor
-        case "tools": tf.stringValue = r.tools
-        case "ttft": tf.stringValue = r.ttft; tf.textColor = .secondaryLabelColor
-        case "tps": tf.stringValue = r.tps + " tok/s"; tf.textColor = .systemBlue
-        default: tf.stringValue = ""
+        return box
+    }
+
+    // MARK: - label helpers
+
+    private func wrappingLabel(_ text: String, font: NSFont, color: NSColor,
+                               maxWidth: CGFloat, background: NSColor?) -> NSTextField {
+        let l = NSTextField(labelWithString: "")
+        l.stringValue = text
+        l.font = font
+        l.textColor = color
+        l.lineBreakMode = .byWordWrapping
+        l.cell?.truncatesLastVisibleLine = false
+        l.cell?.wraps = true
+        l.preferredMaxLayoutWidth = maxWidth - 24
+        l.translatesAutoresizingMaskIntoConstraints = false
+        l.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        l.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        if let bg = background {
+            l.drawsBackground = true
+            l.backgroundColor = bg
+            l.wantsLayer = true
+            // pad via the field's bezel-less inset
+            l.cell?.backgroundStyle = .raised
         }
-        return cell
+        return l
     }
 
-    // MARK: - transcript / status
-
-    private func appendTranscript(_ line: String) {
-        let attr = NSMutableAttributedString(string: line + "\n")
-        attr.addAttribute(.font,
-                         value: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
-                         range: NSRange(location: 0, length: attr.length))
-        transcriptView.textStorage?.append(attr)
-        transcriptView.scrollToEndOfDocument(nil)
+    private func codeLabel(_ text: String, color: NSColor) -> NSTextField {
+        let l = NSTextField(labelWithString: "")
+        l.stringValue = text
+        l.font = Theme.mono()
+        l.textColor = color
+        l.lineBreakMode = .byWordWrapping
+        l.cell?.truncatesLastVisibleLine = false
+        l.cell?.wraps = true
+        l.preferredMaxLayoutWidth = bubbleMaxWidth - 48
+        l.translatesAutoresizingMaskIntoConstraints = false
+        l.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        l.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return l
     }
+
+    // MARK: - status
 
     private func startClock() {
         stopClock()
@@ -588,26 +663,23 @@ final class AppController: NSObject, NSTableViewDataSource, NSTableViewDelegate 
             self?.refreshStatus()
         }
     }
-    private func stopClock() {
-        clockTimer?.invalidate(); clockTimer = nil
-    }
+    private func stopClock() { clockTimer?.invalidate(); clockTimer = nil }
 
     private func refreshStatus() {
         let axOn = AXPermission.check()
         let apiOn = ProcessInfo.processInfo.environment["CEREBRAS_API_KEY"]?.isEmpty == false
-        setDot(axDot, on: axOn)
-        setDot(apiDot, on: apiOn)
-        axLabel.stringValue = axOn ? "Accessibility trusted" : "Accessibility not granted"
-        apiLabel.stringValue = apiOn ? "Cerebras API key set" : "CEREBRAS_API_KEY unset"
+        axDot.layer?.backgroundColor = (axOn ? NSColor.systemGreen : NSColor.systemRed).cgColor
+        apiDot.layer?.backgroundColor = (apiOn ? NSColor.systemGreen : NSColor.systemRed).cgColor
+        statusLeft.stringValue = axOn ? "AX trusted" : "AX not granted"
+        statusRight.stringValue = apiOn ? "API key set" : "API key unset"
 
-        statusLeft.stringValue = "gemma-4-31b · reasoning: none"
         let avgTps: Double = {
             let vals = stepRows.compactMap { $0.tokensPerSecond }
             guard !vals.isEmpty else { return 0 }
             return vals.reduce(0, +) / Double(vals.count)
         }()
         let wall = runStart.map { Date().timeIntervalSince($0) } ?? 0
-        statusCenter.stringValue = String(format: "avg %.0f tok/s · %d steps · %.1fs", avgTps, stepRows.count, wall)
-        statusRight.stringValue = axOn && apiOn ? "ready" : "needs setup"
+        statusCenter.stringValue = String(format: "%d steps · avg %.0f tok/s · %.1fs",
+                                          stepRows.count, avgTps, wall)
     }
 }

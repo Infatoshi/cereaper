@@ -1,5 +1,14 @@
 import Foundation
 
+/// A single row in the steps table / bench view.
+struct StepRow {
+    let step: Int
+    let tools: String
+    let ttft: String
+    let tps: String
+    var tokensPerSecond: Double?
+}
+
 /// Structured events emitted by the agent loop. The GUI renders each case into
 /// its own surface (step table, transcript, screenshot preview, final-answer
 /// panel, status bar). Headless consumers use `.text` for a plain line.
@@ -21,7 +30,9 @@ enum RunEvent {
         switch self {
         case .text(let s): return s
         case .task(let s): return "▸ task: \(s)"
-        case .toolCall(_, let n, let a): return "  → \(n)(\(a))"
+        case .toolCall(_, let n, let a):
+            let arg = a.count > 100 ? String(a.prefix(100)) + "…" : a
+            return "  → \(n)(\(arg))"
         case .toolResult(_, let n, let r): return "  ← \(n): \(r)"
         case .timing(let step, let ttft, let tps, _):
             let t = ttft.map { String(format: "%.0fms", $0 * 1000) } ?? "n/a"

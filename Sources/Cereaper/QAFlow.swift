@@ -64,7 +64,6 @@ enum QAFlow {
         }
 
         @objc func greet() {
-            // BUG: ignores nameField, always shows "Hello, world!"
             label.stringValue = "Hello, world!"
         }
     }

@@ -33,6 +33,8 @@ final class Agent {
     let config: AgentConfig
     let registry: ToolRegistry
 
+    private var messages: [Message] = []
+
     init(client: CerebrasClient = CerebrasClient(),
          config: AgentConfig = AgentConfig(),
          registry: ToolRegistry? = nil) {
@@ -43,6 +45,7 @@ final class Agent {
         } else {
             self.registry = Agent.defaultRegistry(client: client)
         }
+        resetConversation()
     }
 
     static func defaultRegistry(client: CerebrasClient) -> ToolRegistry {
@@ -63,7 +66,33 @@ final class Agent {
         return r
     }
 
+    /// Reset to a fresh system prompt (new chat).
+    func resetConversation() {
+        messages = [.system(Self.systemPrompt(tools: registry.specs.map { $0.function.name }))]
+    }
+
+    /// One-shot run (headless / race). Starts a fresh conversation.
     func run(task: String, onEvent: @escaping (RunEvent) -> Void) async -> RunRecord {
+        resetConversation()
+        messages.append(.userText(task))
+        onEvent(.task(task))
+        return await loop(onEvent: onEvent)
+    }
+
+    /// Multi-turn chat: append a user message and run until the model replies
+    /// (final_answer or a no-tool text turn). Conversation history persists.
+    func send(_ userText: String, onEvent: @escaping (RunEvent) -> Void) async -> RunRecord {
+        guard client.isConfigured else {
+            onEvent(.status("✗ CEREBRAS_API_KEY not set. Export it and relaunch."))
+            onEvent(.stopped("no-api-key"))
+            return RunRecord(stoppedReason: "no-api-key")
+        }
+        messages.append(.userText(userText))
+        onEvent(.task(userText))
+        return await loop(onEvent: onEvent)
+    }
+
+    private func loop(onEvent: @escaping (RunEvent) -> Void) async -> RunRecord {
         var record = RunRecord()
         guard client.isConfigured else {
             onEvent(.status("✗ CEREBRAS_API_KEY not set. Export it and relaunch."))
@@ -71,12 +100,6 @@ final class Agent {
             onEvent(.stopped(record.stoppedReason))
             return record
         }
-
-        onEvent(.task(task))
-        var messages: [Message] = [
-            .system(Self.systemPrompt(tools: registry.specs.map { $0.function.name })),
-            .userText(task),
-        ]
 
         for step in 0..<config.maxSteps {
             do {
@@ -105,8 +128,7 @@ final class Agent {
                                 toolCalls: result.toolCalls.map { $0.name }))
 
                 if !result.text.isEmpty {
-                    let tpsStr = tps.map { String(format: "%.0f", $0) } ?? "n/a"
-                    onEvent(.text("  [\(tpsStr) tok/s] \(result.text)"))
+                    onEvent(.text(result.text))
                 }
                 if result.toolCalls.isEmpty {
                     record.finalAnswer = result.text
