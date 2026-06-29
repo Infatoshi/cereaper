@@ -37,4 +37,22 @@ enum Headless {
         log(Race.summary(results))
         done.signal()
     }
+
+    static func orchestrate(done: DispatchSemaphore) async {
+        log("=== Cereaper orchestrate (async subagent delegation) ===")
+        let orchestrator = Orchestrator()
+        let record = await orchestrator.run(plan: QAOrchestration.plan) { event in
+            log(event.text)
+        }
+        log("--- summary ---")
+        log("stopped: \(record.stoppedReason)")
+        log("steps (incl. synthesis): \(record.steps.count)")
+        let tps = record.steps.compactMap { $0.tokensPerSecond }
+        let avg = tps.isEmpty ? 0 : tps.reduce(0, +) / Double(tps.count)
+        log(String(format: "avg tps=%.0f  screenshots=%d", avg, record.screenshotURLs.count))
+        if !record.finalAnswer.isEmpty {
+            log("final: \(record.finalAnswer)")
+        }
+        done.signal()
+    }
 }

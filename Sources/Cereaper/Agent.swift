@@ -16,6 +16,7 @@ struct RunRecord {
     var steps: [StepRecord] = []
     var finalAnswer: String = ""
     var stoppedReason: String = ""
+    var screenshotURLs: [URL] = []
 }
 
 struct AgentConfig {
@@ -34,6 +35,9 @@ final class Agent {
     let registry: ToolRegistry
 
     private var messages: [Message] = []
+    /// Optional role-specific system prompt (used by Subagent). When nil, the
+    /// default Cereaper system prompt is used.
+    var systemPromptOverride: String?
 
     init(client: CerebrasClient = CerebrasClient(),
          config: AgentConfig = AgentConfig(),
@@ -66,9 +70,44 @@ final class Agent {
         return r
     }
 
+    /// Build a registry restricted to `allowed` tool names, sharing `session` so
+    /// computer_use focus state persists across subagents in one orchestration.
+    /// Empty `allowed` = all tools.
+    static func registry(allowed: [String],
+                         client: CerebrasClient,
+                         session: ComputerUseSession) -> ToolRegistry {
+        let r = ToolRegistry()
+        func reg(_ t: Tool) { r.register(t) }
+        let names = Set(allowed)
+        let all: [(String, () -> Tool)] = [
+            ("read", { ReadTool() }),
+            ("bash", { BashTool() }),
+            ("write", { WriteTool() }),
+            ("screenshot", { ScreenshotTool(session: session) }),
+            ("image_look", { ImageLookTool(client: client) }),
+            ("computer_focus", { ComputerFocusTool(session: session) }),
+            ("computer_state", { ComputerStateTool(session: session) }),
+            ("computer_click", { ComputerClickTool(session: session) }),
+            ("computer_set_value", { ComputerSetValueTool(session: session) }),
+            ("computer_type", { ComputerTypeTool() }),
+            ("computer_press_key", { ComputerPressKeyTool() }),
+            ("final_answer", { FinalAnswerTool() }),
+        ]
+        for (name, make) in all where names.isEmpty || names.contains(name) || name == "final_answer" {
+            reg(make())
+        }
+        // final_answer is always available so subagents can terminate.
+        if r.tools["final_answer"] == nil { reg(FinalAnswerTool()) }
+        return r
+    }
+
     /// Reset to a fresh system prompt (new chat).
     func resetConversation() {
-        messages = [.system(Self.systemPrompt(tools: registry.specs.map { $0.function.name }))]
+        if let override = systemPromptOverride {
+            messages = [.system(override)]
+        } else {
+            messages = [.system(Self.systemPrompt(tools: registry.specs.map { $0.function.name }))]
+        }
     }
 
     /// One-shot run (headless / race). Starts a fresh conversation.
@@ -94,6 +133,7 @@ final class Agent {
 
     private func loop(onEvent: @escaping (RunEvent) -> Void) async -> RunRecord {
         var record = RunRecord()
+        var lastToolResult = ""
         guard client.isConfigured else {
             onEvent(.status("✗ CEREBRAS_API_KEY not set. Export it and relaunch."))
             record.stoppedReason = "no-api-key"
@@ -127,15 +167,22 @@ final class Agent {
                                 tokensPerSecond: tps,
                                 toolCalls: result.toolCalls.map { $0.name }))
 
-                if !result.text.isEmpty {
-                    onEvent(.text(result.text))
-                }
+                // Terminal: model finished with free text (no tool calls).
+                // The free text IS the final answer — emit it once as finalAnswer,
+                // never as a narration .text line (that caused duplicate chat lines).
                 if result.toolCalls.isEmpty {
                     record.finalAnswer = result.text
                     record.stoppedReason = "model-done"
                     onEvent(.finalAnswer(result.text))
                     onEvent(.stopped(record.stoppedReason))
                     return record
+                }
+
+                // Mid-loop narration only. Skip when the model is calling
+                // final_answer (its argument is the answer, not the free text).
+                let hasFinal = result.toolCalls.contains { $0.name == "final_answer" }
+                if !result.text.isEmpty && !hasFinal {
+                    onEvent(.text(result.text))
                 }
 
                 // Append the assistant turn with tool calls.
@@ -157,7 +204,9 @@ final class Agent {
                     if call.name == "screenshot",
                        let url = output.split(separator: "\n").compactMap({ URL(string: "file://\($0.trimmingCharacters(in: .whitespaces))") }).first {
                         onEvent(.screenshot(url))
+                        record.screenshotURLs.append(url)
                     }
+                    lastToolResult = output
                     messages.append(.tool(result: output, callId: call.id))
                 }
             } catch {
@@ -168,6 +217,11 @@ final class Agent {
             }
         }
 
+        // Budget exhausted: fall back to the last tool result so a subagent that
+        // gathered its answer but didn't call final_answer still yields something.
+        if record.finalAnswer.isEmpty, !lastToolResult.isEmpty {
+            record.finalAnswer = lastToolResult
+        }
         record.stoppedReason = "step-budget-exhausted"
         onEvent(.text("✗ step budget exhausted (\(config.maxSteps))"))
         onEvent(.stopped(record.stoppedReason))

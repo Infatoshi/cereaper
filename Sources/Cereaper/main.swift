@@ -1,9 +1,10 @@
 import AppKit
 
 // Cereaper entry point. GUI by default; headless modes for testing/recording:
-//   swift run --smoke      screenshot + image_look + final_answer
-//   swift run --qa         full QA hero flow
-//   swift run --race       Cerebras telemetry for the QA prompt
+//   swift run --smoke         screenshot + image_look + final_answer
+//   swift run --qa            full QA hero flow (single agent)
+//   swift run --orchestrate   QA flow as async subagent delegation
+//   swift run --race          Cerebras telemetry for the QA prompt
 
 let args = CommandLine.arguments
 let done = DispatchSemaphore(value: 0)
@@ -13,6 +14,8 @@ case "--smoke":
     Task { await Headless.run(prompt: QAFlow.smokePrompt, label: "smoke", done: done) }
 case "--qa":
     Task { await Headless.run(prompt: QAFlow.heroPrompt, label: "qa", done: done) }
+case "--orchestrate":
+    Task { await Headless.orchestrate(done: done) }
 case "--race":
     Task { await Headless.race(done: done) }
 default:

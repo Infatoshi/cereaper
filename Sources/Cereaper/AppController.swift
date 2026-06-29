@@ -63,6 +63,7 @@ final class AppController: NSObject, NSTextViewDelegate {
     private var items: [ChatItem] = []
     private var currentAssistant: Int? = nil
     private var isRunning = false
+    private var isOrchestrating = false
     private var runStart: Date?
     private var clockTimer: Timer?
 
@@ -324,7 +325,7 @@ final class AppController: NSObject, NSTextViewDelegate {
     }
 
     @objc func smokeTapped() { sendImmediately(QAFlow.smokePrompt) }
-    @objc func qaTapped() { sendImmediately(QAFlow.heroPrompt) }
+    @objc func qaTapped() { orchestrate() }
 
     @objc func stopTapped() {
         isRunning = false
@@ -363,11 +364,44 @@ final class AppController: NSObject, NSTextViewDelegate {
         send(text)
     }
 
+    /// Run the QA flow as async subagent delegation (orchestrator + parallel
+    /// inspectors). The chat shows phases + subagent results in completion order.
+    private func orchestrate() {
+        guard !isRunning else { return }
+        isRunning = true
+        isOrchestrating = true
+        setRunUI(running: true)
+        resetLog()
+        items.append(.user("QA demo — async subagent delegation"))
+        items.append(.assistant(text: "", tools: []))
+        currentAssistant = items.count - 1
+        render()
+        runStart = Date()
+        startClock()
+
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let orchestrator = Orchestrator()
+            let record = await orchestrator.run(plan: QAOrchestration.plan) { [weak self] event in
+                Task { @MainActor in self?.handle(event) }
+            }
+            await MainActor.run { [weak self] in
+                self?.lastRecord = record
+                self?.isRunning = false
+                self?.isOrchestrating = false
+                self?.currentAssistant = nil
+                self?.setRunUI(running: false)
+                self?.stopClock()
+            }
+        }
+    }
+
     private func send(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty, !isRunning else { return }
         isRunning = true
         setRunUI(running: true)
+        resetLog()
         items.append(.user(t))
         items.append(.assistant(text: "", tools: []))
         currentAssistant = items.count - 1
@@ -400,6 +434,12 @@ final class AppController: NSObject, NSTextViewDelegate {
     // MARK: - events → chat model
 
     private func handle(_ event: RunEvent) {
+        logLine(event.text)
+        if isOrchestrating {
+            handleOrchestration(event)
+            render()
+            return
+        }
         switch event {
         case .task:
             break // already added the user bubble in send()
@@ -408,12 +448,15 @@ final class AppController: NSObject, NSTextViewDelegate {
         case .status(let s):
             appendAssistantText(s)
         case .toolCall(_, let name, let args):
+            // Raw screenshot capture is hidden in the chat; the image_look card
+            // shows the image + OCR instead.
+            if name == "screenshot" { break }
             appendToolCard(ToolCard(name: name, arguments: args, result: nil, image: nil))
         case .toolResult(_, let name, let result):
             fillToolResult(name: name, result: result)
         case .screenshot(let url):
             screenshotURLs.append(url)
-            if let img = NSImage(contentsOf: url) { attachScreenshot(img) }
+            // Image is rendered by the image_look card; no separate attach.
         case .timing(let step, let ttft, let tps, let tools):
             stepRows.append(StepRow(
                 step: step,
@@ -428,8 +471,65 @@ final class AppController: NSObject, NSTextViewDelegate {
             appendAssistantText(summary)
         case .stopped:
             render()
+        case .phase, .subagentStart, .subagentResult:
+            break // only used in orchestration mode
         }
         render()
+    }
+
+    /// Orchestration rendering: phase + subagent lines in completion order, plus
+    /// the synthesis final answer. Subagent-internal tool chatter is suppressed
+    /// (it would interleave); timing + screenshots still feed Bench/Gallery.
+    private func handleOrchestration(_ event: RunEvent) {
+        switch event {
+        case .phase(let p):
+            appendAssistantText("── phase \(p) ──")
+        case .subagentStart(let role, _):
+            appendAssistantText("◷ spawn \(role)")
+        case .subagentResult(let role, _, let answer, let ok):
+            let mark = ok ? "✓" : "✗"
+            appendAssistantText("\(mark) \(role) → \(answer)")
+        case .timing(let step, let ttft, let tps, let tools):
+            stepRows.append(StepRow(
+                step: step,
+                tools: tools.joined(separator: ","),
+                ttft: ttft.map { String(format: "%.0fms", $0 * 1000) } ?? "—",
+                tps: tps.map { String(format: "%.0f", $0) } ?? "—",
+                tokensPerSecond: tps
+            ))
+            refreshStatus()
+        case .screenshot(let url):
+            screenshotURLs.append(url)
+        case .finalAnswer(let s):
+            appendAssistantText(extractSummary(s))
+        case .stopped:
+            render()
+        case .task, .text, .status, .toolCall, .toolResult:
+            break // suppress subagent chatter in orchestration mode
+        }
+    }
+
+    // MARK: - logging (so the run can be inspected / debugged from disk)
+
+    private static var logURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cereaper/logs/latest.log")
+    }
+
+    private func resetLog() {
+        let url = Self.logURL
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        try? Data().write(to: url)
+    }
+
+    private func logLine(_ s: String) {
+        let line = (s + "\n").data(using: .utf8) ?? Data()
+        if let handle = try? FileHandle(forWritingTo: Self.logURL) {
+            handle.seekToEndOfFile()
+            handle.write(line)
+            try? handle.close()
+        }
     }
 
     private func appendAssistantText(_ s: String) {
@@ -544,6 +644,27 @@ final class AppController: NSObject, NSTextViewDelegate {
     }
 
     private func toolCardView(_ card: ToolCard) -> NSView {
+        // Screenshots render as a bare mini preview — no card chrome, no path text.
+        if card.name == "screenshot", let image = card.image {
+            let iv = NSImageView()
+            iv.image = image
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.heightAnchor.constraint(lessThanOrEqualToConstant: 180).isActive = true
+            iv.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth).isActive = true
+            iv.wantsLayer = true
+            iv.layer?.cornerRadius = 8
+            iv.layer?.masksToBounds = true
+            iv.layer?.borderColor = Theme.cardBorder.cgColor
+            iv.layer?.borderWidth = 1
+            return iv
+        }
+
+        // image_look renders as: mini image preview + OCR text panel.
+        if card.name == "image_look" {
+            return imageLookView(card)
+        }
+
         let box = NSView()
         box.wantsLayer = true
         box.layer?.backgroundColor = Theme.card.cgColor
@@ -613,6 +734,112 @@ final class AppController: NSObject, NSTextViewDelegate {
             box.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth),
         ])
         return box
+    }
+
+    /// image_look card: mini image preview + OCR text panel + dim description.
+    private func imageLookView(_ card: ToolCard) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        // Parse the path from the tool arguments.
+        var path: String?
+        if let data = card.arguments.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            path = obj["path"] as? String
+        }
+
+        // Parse description + ocr from the result JSON.
+        var description: String?
+        var ocr: String?
+        if let r = card.result, let data = r.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            description = obj["description"] as? String
+            ocr = obj["ocr"] as? String
+        }
+
+        let col = NSStackView()
+        col.orientation = .vertical
+        col.alignment = .leading
+        col.spacing = 6
+        col.translatesAutoresizingMaskIntoConstraints = false
+        col.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth).isActive = true
+
+        // Mini image preview.
+        if let p = path, let img = NSImage(contentsOf: URL(fileURLWithPath: p)) {
+            let iv = NSImageView()
+            iv.image = img
+            iv.imageScaling = .scaleProportionallyUpOrDown
+            iv.translatesAutoresizingMaskIntoConstraints = false
+            iv.heightAnchor.constraint(lessThanOrEqualToConstant: 180).isActive = true
+            iv.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth).isActive = true
+            iv.wantsLayer = true
+            iv.layer?.cornerRadius = 8
+            iv.layer?.masksToBounds = true
+            iv.layer?.borderColor = Theme.cardBorder.cgColor
+            iv.layer?.borderWidth = 1
+            col.addArrangedSubview(iv)
+        }
+
+        // OCR panel: bordered box with mono text.
+        let ocrBox = NSView()
+        ocrBox.translatesAutoresizingMaskIntoConstraints = false
+        ocrBox.wantsLayer = true
+        ocrBox.layer?.backgroundColor = Theme.card.cgColor
+        ocrBox.layer?.borderColor = Theme.cardBorder.cgColor
+        ocrBox.layer?.borderWidth = 1
+        ocrBox.layer?.cornerRadius = 6
+
+        let ocrHeader = NSTextField(labelWithString: "OCR")
+        ocrHeader.translatesAutoresizingMaskIntoConstraints = false
+        ocrHeader.font = .systemFont(ofSize: 9, weight: .semibold)
+        ocrHeader.textColor = Theme.textDim
+
+        let ocrText = NSTextField(labelWithString: "")
+        ocrText.translatesAutoresizingMaskIntoConstraints = false
+        ocrText.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        ocrText.textColor = Theme.textSub
+        ocrText.lineBreakMode = .byWordWrapping
+        ocrText.maximumNumberOfLines = 6
+        ocrText.preferredMaxLayoutWidth = bubbleMaxWidth - 24
+        ocrText.stringValue = {
+            if let o = ocr, !o.isEmpty { return o }
+            if card.result == nil { return "reading text…" }
+            return "—"
+        }()
+
+        ocrBox.addSubview(ocrHeader)
+        ocrBox.addSubview(ocrText)
+        NSLayoutConstraint.activate([
+            ocrHeader.topAnchor.constraint(equalTo: ocrBox.topAnchor, constant: 6),
+            ocrHeader.leadingAnchor.constraint(equalTo: ocrBox.leadingAnchor, constant: 10),
+            ocrText.topAnchor.constraint(equalTo: ocrBox.topAnchor, constant: 6),
+            ocrText.leadingAnchor.constraint(equalTo: ocrBox.leadingAnchor, constant: 40),
+            ocrText.trailingAnchor.constraint(equalTo: ocrBox.trailingAnchor, constant: -10),
+            ocrText.bottomAnchor.constraint(equalTo: ocrBox.bottomAnchor, constant: -6),
+            ocrBox.widthAnchor.constraint(lessThanOrEqualToConstant: bubbleMaxWidth),
+        ])
+        col.addArrangedSubview(ocrBox)
+
+        // Dim description caption.
+        if let d = description, !d.isEmpty {
+            let cap = NSTextField(labelWithString: d)
+            cap.translatesAutoresizingMaskIntoConstraints = false
+            cap.font = .systemFont(ofSize: 10, weight: .regular)
+            cap.textColor = Theme.textDim
+            cap.lineBreakMode = .byTruncatingTail
+            cap.maximumNumberOfLines = 2
+            cap.preferredMaxLayoutWidth = bubbleMaxWidth - 8
+            col.addArrangedSubview(cap)
+        }
+
+        container.addSubview(col)
+        NSLayoutConstraint.activate([
+            col.topAnchor.constraint(equalTo: container.topAnchor),
+            col.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            col.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            col.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+        return container
     }
 
     // MARK: - label helpers

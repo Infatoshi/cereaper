@@ -24,6 +24,9 @@ enum RunEvent {
     case finalAnswer(String)
     case stopped(String)
     case status(String)
+    case phase(Int)
+    case subagentStart(role: String, instruction: String)
+    case subagentResult(role: String, instruction: String, finalAnswer: String, ok: Bool)
 
     /// Single-line rendering for headless / plain-text consumers.
     var text: String {
@@ -42,6 +45,10 @@ enum RunEvent {
         case .finalAnswer(let s): return "▸ final_answer: \(s)"
         case .stopped(let s): return "▸ stopped: \(s)"
         case .status(let s): return s
+        case .phase(let p): return "── phase \(p) ──"
+        case .subagentStart(let role, _): return "  ◷ spawn \(role)"
+        case .subagentResult(let role, _, let answer, let ok):
+            return "  \(ok ? "✓" : "✗") \(role) done: \(answer.prefix(200))"
         }
     }
 }

@@ -190,20 +190,37 @@ final class ScreenshotTool: Tool {
     }
 }
 
-// MARK: - image_look (multimodal verify via Cerebras Gemma 4)
+// MARK: - image_look (multimodal verify via Cerebras Gemma 4 + OCR)
 
 final class ImageLookTool: Tool {
     let name = "image_look"
     let spec = ToolSpec(type: "function", function: .init(
         name: "image_look",
-        description: "Look at an image file and answer a question about it using Gemma 4 vision. Use to verify screenshots of UI state.",
+        description: "Look at an image file. Returns a JSON object with a `description` (answer to the question) and `ocr` (exact transcription of all text visible in the image). Use to verify screenshots of UI state.",
         parameters: .object([
             (name: "path", schema: .string(description: "Absolute path to a PNG/JPEG/WebP"), required: true),
             (name: "question", schema: .string(description: "Question about the image"), required: true),
         ])
     ))
     let client: CerebrasClient
-    init(client: CerebrasClient) { self.client = client }
+    let ocrClient: CerebrasClient
+
+    init(client: CerebrasClient, ocrClient: CerebrasClient? = nil) {
+        self.client = client
+        self.ocrClient = ocrClient ?? ImageLookTool.buildOCRClient(default: client)
+    }
+
+    /// OCR model is configurable via env so a dedicated OCR model can be used for
+    /// dense UI text. Defaults to the same Cerebras Gemma 4 client (on-theme).
+    ///   CERAPER_OCR_API_KEY / CERAPER_OCR_BASE_URL / CERAPER_OCR_MODEL
+    static func buildOCRClient(default def: CerebrasClient) -> CerebrasClient {
+        let env = ProcessInfo.processInfo.environment
+        guard let key = env["CERAPER_OCR_API_KEY"], !key.isEmpty else { return def }
+        let base = env["CERAPER_OCR_BASE_URL"].flatMap(URL.init(string:))
+            ?? URL(string: "https://generativelanguage.googleapis.com/v1beta/openai")!
+        let model = env["CERAPER_OCR_MODEL"] ?? "gemini-2.5-flash"
+        return CerebrasClient(apiKey: key, baseURL: base, model: model)
+    }
 
     func run(argumentsJSON: String) async throws -> String {
         let path = try Self.stringArg("path", from: argumentsJSON)
@@ -212,7 +229,9 @@ final class ImageLookTool: Tool {
         let mime = path.lowercased().hasSuffix(".jpg") || path.lowercased().hasSuffix(".jpeg")
             ? "image/jpeg" : "image/png"
         let uri = "data:\(mime);base64,\(data.base64EncodedString())"
-        let result = try await client.complete(
+
+        // Description pass: answer the question (Gemma 4 multimodal).
+        let desc = try await client.complete(
             messages: [
                 .system("You inspect screenshots. Answer the question concisely and factually. If you cannot tell, say so."),
                 .user([.text(question), .image(dataURI: uri)]),
@@ -221,7 +240,27 @@ final class ImageLookTool: Tool {
             temperature: 0,
             maxTokens: 300
         )
-        return result.text
+
+        // OCR pass: exact transcription of all visible text. Uses the configurable
+        // OCR client (defaults to Cerebras Gemma 4; point at a dedicated OCR model
+        // via env for harder UIs).
+        let ocr = try await ocrClient.complete(
+            messages: [
+                .system("You are an OCR engine. Transcribe EVERY piece of text visible in the image, exactly as it appears, preserving reading order. Output only the transcribed text, line by line. No commentary."),
+                .user([.text("Transcribe all visible text."), .image(dataURI: uri)]),
+            ],
+            reasoningEffort: "none",
+            temperature: 0,
+            maxTokens: 500
+        )
+
+        let obj: [String: Any] = [
+            "description": desc.text,
+            "ocr": ocr.text,
+            "path": path,
+        ]
+        let jsonData = try JSONSerialization.data(withJSONObject: obj, options: [])
+        return String(data: jsonData, encoding: .utf8) ?? desc.text
     }
 }
 
